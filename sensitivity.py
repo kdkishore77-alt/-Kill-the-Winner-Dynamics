@@ -1,467 +1,155 @@
-import numpy as np
+"""
+sensitivity.py -- one-at-a-time (OAT) robustness analyses, using the SAME model
+(plankton_model.py) as the main experiment.
+
+    python sensitivity.py --analysis tier1        # rho*, delta_v, V*         (original three)
+    python sensitivity.py --analysis tier2        # every other model parameter          [R2]
+    python sensitivity.py --analysis grid         # L = 50, 70, 100, 140                 [R1-8, R2]
+    python sensitivity.py --analysis tradeoff     # alpha and exponent of K = alpha r^k  [R2]
+    python sensitivity.py --analysis tradeoff_matched  # exponent k with alpha rescaled so the mean K_s is unchanged
+    python sensitivity.py --analysis mutation     # mu = 0, .001, .01, .05               [R1-5]
+    python sensitivity.py --analysis all --reps 10 --gens 600 --workers 8
+    QUICK=1 python sensitivity.py --analysis tier1   # tiny smoke test
+
+Changes relative to the submitted version:
+  * The submitted sensitivity script was NOT the main model: it let viral particles diffuse
+    (main model: no viral transport), re-seeded numpy's global generator to 42 inside every
+    constructor (so all replicates shared one random stream after initialisation), and
+    compared KtW only with the no-mortality ablation. It now imports the main model.
+  * The decisive control (fixed mortality) is included in every sweep, and p_fixed is
+    RE-CALIBRATED at every parameter value so the fixed condition always kills as many fed
+    cells per generation as KtW does at that value.
+  * The three conditions share the starting lattice of each replicate (paired design).
+  * Default is 10 replicates x 600 generations (was 5 x 600); the 600-generation horizon is
+    justified by extended_run_checkpoints.csv written by 1A.py.
+  * Collapse criterion (Delta H' < 0.05) is applied to KtW - Fixed (decisive) and KtW - None.
+"""
+import argparse, os
+import numpy as np, pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import convolve2d
-from scipy.stats import entropy
+from concurrent.futures import ProcessPoolExecutor
+
+from plankton_model import PlanktonEcosystemSimulation as Sim, calibrate_fixed_rate
+
+QUICK = os.environ.get('QUICK') == '1'
+COLLAPSE = 0.05
+CONDS = [('KtW_ON', 'ktw'), ('Fixed_Mort', 'fixed'), ('KtW_OFF', 'none')]
+COL = {'KtW_ON': '#2166AC', 'Fixed_Mort': '#D6604D', 'KtW_OFF': '#F4A82E'}
+
+# baselines (Table 1); keys are Sim() keyword names
+BASE = dict(grid_size=70, num_strains=12, mutation_rate=0.0, alpha=2.0, tradeoff_exp=2.0,
+            nutrient_inflow=0.10, nutrient_max=3.0, delta_v=0.8, lambda_v=0.98, rho_star=0.35,
+            v_star=1.0, v_ref=2.0, p_max=0.95, p_d=0.30, t_s=3, eta=2, phi0=0.70)
+
+SWEEPS = {
+    'tier1': {'rho_star': [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
+              'delta_v': [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6],
+              'v_star': [0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8]},
+    'tier2': {'v_ref': [1.0, 1.5, 2.0, 3.0, 4.0], 'p_max': [0.5, 0.7, 0.95, 1.0],
+              'lambda_v': [0.90, 0.95, 0.98, 0.99], 'p_d': [0.1, 0.2, 0.3, 0.4, 0.5],
+              't_s': [1, 2, 3, 5, 8], 'eta': [1, 2, 3, 4],
+              'nutrient_inflow': [0.05, 0.075, 0.10, 0.15, 0.20], 'nutrient_max': [1.5, 3.0, 6.0],
+              'phi0': [0.3, 0.5, 0.7, 0.9], 'num_strains': [6, 12, 24]},
+    'grid': {'grid_size': [50, 70, 100, 140]},
+    # tradeoff_exp = 0 removes the trade-off altogether (K_s = alpha for every strain)
+    'tradeoff': {'alpha': [0.5, 1.0, 2.0, 3.0, 4.0], 'tradeoff_exp': [0.0, 1.0, 2.0, 3.0]},
+    'mutation': {'mutation_rate': [0.0, 0.001, 0.01, 0.05]},
+    # Exponent test with the mean half-saturation constant held at its baseline value:
+    # alpha is rescaled for every k, so only the SHAPE of the trade-off changes (k = 0 gives
+    # identical K_s for all strains, i.e. no trade-off). The plain 'tradeoff' sweep above changes
+    # both shape and level of K_s; with k = 0 and alpha = 2, K_s = 2 exceeds the initial nutrient
+    # and the lattice empties, so that point is not informative about the trade-off.
+    'tradeoff_matched': {'tradeoff_exp': [0.0, 1.0, 2.0, 3.0]},
+}
+LABEL = {'rho_star': 'ρ*', 'delta_v': 'δ_v', 'v_star': 'V*', 'v_ref': 'V_ref', 'p_max': 'p_max',
+         'lambda_v': 'λ_v', 'p_d': 'p_d', 't_s': 'T_s', 'eta': 'η', 'nutrient_inflow': 'I_n',
+         'nutrient_max': 'N_max', 'phi0': 'φ_0', 'num_strains': 'M', 'grid_size': 'L',
+         'alpha': 'α', 'tradeoff_exp': 'trade-off exponent k', 'mutation_rate': 'μ'}
+
+
+def matched_alpha(k, base=BASE):
+    """alpha such that the mean K_s over the (fixed-seed) strain traits equals its baseline value."""
+    r = np.random.default_rng(42).uniform(0.15, 0.45, size=base['num_strains'] + 1)[1:]
+    return float(base['alpha'] * np.mean(r ** base['tradeoff_exp']) / np.mean(r ** k))
+
+
+def run_point(job):
+    """One (parameter value, condition, replicate) simulation. Top-level for multiprocessing."""
+    param, value, cname, mode, rep, p_fixed, gens, kw = job
+    sim = Sim(mode=mode, fixed_mort_rate=p_fixed, seed=rep, **kw).run(gens)
+    last = slice(-50, None)
+    return dict(parameter=param, value=value, condition=cname, replicate=rep,
+                shannon=float(np.mean(sim.history_diversity[last])),
+                richness=float(np.mean(sim.history_richness[last])),
+                richness_ge10=float(np.mean(sim.history_richness10[last])),
+                dominant_pct=100 * float(np.mean(sim.history_dominant[last])),
+                vacancies=float(np.mean(sim.history_vacancies[last])),
+                realised_death_rate=sim.mean_lysis_rate(), p_fixed=p_fixed)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--analysis', default='tier1', choices=list(SWEEPS) + ['all'])
+    ap.add_argument('--reps', type=int, default=10)
+    ap.add_argument('--gens', type=int, default=600)
+    ap.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    a = ap.parse_args()
+    if QUICK: a.reps, a.gens = 2, 40
+    pilot = (2, 40) if QUICK else (4, 300)
+    names = list(SWEEPS) if a.analysis == 'all' else [a.analysis]
+
+    with ProcessPoolExecutor(max_workers=a.workers) as ex:
+        for analysis in names:
+            print(f'=== {analysis}: {a.reps} replicates x {a.gens} generations ===')
+            jobs, meta = [], []
+            for param, values in SWEEPS[analysis].items():
+                if QUICK: values = values[:2]
+                for v in values:
+                    kw = dict(BASE); kw[param] = v
+                    if analysis == 'tradeoff_matched':
+                        kw['alpha'] = matched_alpha(v)
+                    if param == 'grid_size':                       # keep run time reasonable
+                        pass
+                    # re-calibrate the fixed-mortality rate for THIS parameter setting
+                    pf = calibrate_fixed_rate(*pilot, **kw)
+                    for cname, mode in CONDS:
+                        for rep in range(a.reps):
+                            jobs.append((param, v, cname, mode, rep, pf, a.gens, kw))
+            raw = pd.DataFrame(list(ex.map(run_point, jobs, chunksize=1)))
+            raw.to_csv(f'sensitivity_{analysis}_raw.csv', index=False)
+
+            g = raw.groupby(['parameter', 'value', 'condition'])
+            piv = g['shannon'].mean().unstack('condition')
+            sd = g['shannon'].std().unstack('condition')
+            out = piv.copy()
+            out['dH_vs_fixed'] = piv['KtW_ON'] - piv['Fixed_Mort']
+            out['dH_vs_none'] = piv['KtW_ON'] - piv['KtW_OFF']
+            out['status_vs_fixed'] = np.where(out['dH_vs_fixed'] >= COLLAPSE, 'ROBUST', 'COLLAPSED')
+            out['status_vs_none'] = np.where(out['dH_vs_none'] >= COLLAPSE, 'ROBUST', 'COLLAPSED')
+            out['p_fixed_used'] = raw.groupby(['parameter', 'value'])['p_fixed'].mean()
+            out['richness_KtW'] = g['richness'].mean().unstack('condition')['KtW_ON']
+            out['richness_Fixed'] = g['richness'].mean().unstack('condition')['Fixed_Mort']
+            out['richness_None'] = g['richness'].mean().unstack('condition')['KtW_OFF']
+            out.reset_index().to_csv(f'sensitivity_{analysis}_summary.csv', index=False)
+            print(out[['KtW_ON', 'Fixed_Mort', 'KtW_OFF', 'dH_vs_fixed', 'dH_vs_none',
+                       'status_vs_fixed', 'status_vs_none']].round(3).to_string())
+
+            params = list(SWEEPS[analysis])
+            fig, axs = plt.subplots(1, len(params), figsize=(4.2 * len(params), 3.8), squeeze=False)
+            for ax, p in zip(axs[0], params):
+                for c, _ in CONDS:
+                    m = piv.xs(p, level='parameter')[c]; s = sd.xs(p, level='parameter')[c]
+                    ax.plot(m.index, m.values, 'o-', color=COL[c], label=c.replace('_', ' '))
+                    ax.fill_between(m.index, m - s, m + s, color=COL[c], alpha=0.2)
+                ax.axvline(BASE[p], color='gray', ls='--'); ax.set_xlabel(LABEL[p])
+                ax.set_ylabel("Final Shannon H′" if ax is axs[0][0] else '')
+            axs[0][0].legend(fontsize=8)
+            fig.suptitle(f'Sensitivity ({analysis}): mean ± s.d., n={a.reps}, {a.gens} generations')
+            fig.tight_layout(); fig.savefig(f'sensitivity_{analysis}.png', dpi=300); plt.close(fig)
+    print('Done.')
 
-
-# =============================================================================
-# CORE SIMULATION CLASS (aligned with main model)
-# =============================================================================
-
-class PlanktonEcosystemSimulation:
-    """
-    Three-rule plankton cellular automaton.
-    Parameterised fully via constructor to support sensitivity sweeps.
-    """
-
-    def __init__(
-        self,
-        grid_size=70,
-        num_strains=12,
-        mutation_rate=0.0,
-        ktw_enabled=True,
-        crowding_threshold=0.35,   # rho*
-        viral_increment=0.8,       # delta_v
-        lysis_threshold=1.0,       # V*
-        lysis_ref=2.0,             # V_ref
-        max_lysis_prob=0.95,       # p_max
-        displacement_prob=0.30,    # p_d
-        starvation_steps=3,        # T_s
-        alpha=2.0,                 # trade-off scaling
-        nutrient_inflow=0.10,      # I_n
-        nutrient_max=3.0,          # N_max
-        seed=None,
-    ):
-        self.N = grid_size
-        self.num_strains = num_strains
-        self.mutation_rate = mutation_rate
-        self.ktw_enabled = ktw_enabled
-
-        # KtW parameters
-        self.crowding_threshold = crowding_threshold
-        self.viral_increment = viral_increment
-        self.lysis_threshold = lysis_threshold
-        self.lysis_ref = lysis_ref
-        self.max_lysis_prob = max_lysis_prob
-
-        # Competition / mortality parameters
-        self.displacement_prob = displacement_prob
-        self.starvation_steps = starvation_steps
-
-        # Environmental parameters
-        self.alpha = alpha
-        self.nutrient_inflow = nutrient_inflow
-        self.nutrient_max = nutrient_max
-
-        # Starvation counter
-        self.starvation_counter = np.zeros((self.N, self.N), dtype=int)
-
-        # Grid initialisation
-        if seed is not None:
-            np.random.seed(seed)
-        self.grid = np.random.choice(
-            [0] + list(range(1, num_strains + 1)),
-            size=(self.N, self.N),
-            p=[0.7] + [0.3 / num_strains] * num_strains,
-        )
-
-        # Nutrient and viral layers
-        self.nutrients = np.ones((self.N, self.N)) * 1.0
-        self.viruses = np.zeros((num_strains + 1, self.N, self.N))
-
-        # Strain trade-off profiles (fixed seed for reproducibility across runs)
-        np.random.seed(42)
-        self.r = np.random.uniform(0.15, 0.45, size=num_strains + 1)
-        self.K = self.alpha * (self.r ** 2)
-
-        # Diffusion kernel
-        self.diffusion_kernel = np.array(
-            [[0.05, 0.10, 0.05],
-             [0.10, 0.40, 0.10],
-             [0.05, 0.10, 0.05]]
-        )
-
-        # History
-        self.history_diversity = []
-        self.history_vacancies = []
-        self.history_dominant = []
-        self.history_richness = []
-
-    # -------------------------------------------------------------------------
-    def _apply_fluid_diffusion(self):
-        self.nutrients = convolve2d(
-            self.nutrients, self.diffusion_kernel, mode='same', boundary='wrap'
-        )
-        self.nutrients += self.nutrient_inflow
-        self.nutrients = np.clip(self.nutrients, 0.0, self.nutrient_max)
-
-        for s in range(1, self.num_strains + 1):
-            self.viruses[s] = convolve2d(
-                self.viruses[s], self.diffusion_kernel, mode='same', boundary='wrap'
-            )
-            self.viruses[s] *= 0.98
-
-    # -------------------------------------------------------------------------
-    def step(self):
-        next_grid = self.grid.copy()
-        coords = [(r, c) for r in range(self.N) for c in range(self.N)]
-        np.random.shuffle(coords)
-
-        for r, c in coords:
-            strain = self.grid[r, c]
-            if strain == 0:
-                continue
-
-            local_n = self.nutrients[r, c]
-            monod_growth_prob = self.r[strain] * (local_n / (self.K[strain] + local_n))
-
-            if local_n >= self.K[strain]:
-                self.nutrients[r, c] -= self.K[strain]
-                self.starvation_counter[r, c] = 0
-
-                if self.ktw_enabled:
-                    rows = [(r + dr) % self.N for dr in range(-2, 3)]
-                    cols = [(c + dc) % self.N for dc in range(-2, 3)]
-                    local_patch = self.grid[np.ix_(rows, cols)]
-                    local_density = np.sum(local_patch == strain) / local_patch.size
-
-                    if local_density > self.crowding_threshold:
-                        self.viruses[strain, r, c] += self.viral_increment
-
-                    viral_pressure = self.viruses[strain, r, c]
-                    if viral_pressure > self.lysis_threshold:
-                        infection_prob = min(
-                            self.max_lysis_prob, viral_pressure / self.lysis_ref
-                        )
-                        if np.random.rand() < infection_prob:
-                            next_grid[r, c] = 0
-                            self.starvation_counter[r, c] = 0
-                            continue
-
-                if np.random.rand() < monod_growth_prob:
-                    dr = np.random.choice([-1, 0, 1])
-                    dc = np.random.choice([-1, 0, 1])
-                    nr, nc = (r + dr) % self.N, (c + dc) % self.N
-                    target = self.grid[nr, nc]
-
-                    if target == 0:
-                        next_grid[nr, nc] = strain
-                        self.starvation_counter[nr, nc] = 0
-                    elif target != strain:
-                        if np.random.rand() < self.displacement_prob:
-                            next_grid[nr, nc] = strain
-                            self.starvation_counter[nr, nc] = 0
-            else:
-                self.starvation_counter[r, c] += 1
-                if self.starvation_counter[r, c] >= self.starvation_steps:
-                    next_grid[r, c] = 0
-                    self.starvation_counter[r, c] = 0
-
-        self.grid = next_grid
-        self._apply_fluid_diffusion()
-
-        counts = np.bincount(self.grid.flatten(), minlength=self.num_strains + 1)
-        occupied = np.sum(counts[1:])
-        if occupied > 0:
-            p = counts[1:] / occupied
-            shannon_H = entropy(p[p > 0])
-            dominant_fraction = np.max(counts[1:]) / self.grid.size
-            richness = np.sum(counts[1:] >= 20)
-        else:
-            shannon_H = 0.0
-            dominant_fraction = 0.0
-            richness = 0
-
-        self.history_diversity.append(shannon_H)
-        self.history_vacancies.append(self.grid.size - occupied)
-        self.history_dominant.append(dominant_fraction)
-        self.history_richness.append(richness)
-
-    # -------------------------------------------------------------------------
-    def run(self, generations):
-        for _ in range(generations):
-            self.step()
-
-
-# =============================================================================
-# SENSITIVITY ANALYSIS CLASS
-# =============================================================================
-
-class SensitivityAnalysis:
-    """
-    One-at-a-time (OAT) sensitivity analysis over Tier 1 KtW parameters:
-        rho*       : crowding_threshold
-        delta_v    : viral_increment
-        V*         : lysis_threshold
-
-    For each parameter, a range of values is swept while all others are held
-    at their baseline. KtW-ON and KtW-OFF replicates are run per value to
-    preserve the ablation framing of the main study.
-    """
-
-    # Baseline parameter values (aligned with main model)
-    BASELINE = dict(
-        crowding_threshold=0.35,
-        viral_increment=0.8,
-        lysis_threshold=1.0,
-    )
-
-    # Sweep ranges for each Tier 1 parameter
-    SWEEPS = {
-        'crowding_threshold': [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50],
-        'viral_increment':    [0.2,  0.4,  0.6,  0.8,  1.0,  1.2,  1.4,  1.6],
-        'lysis_threshold':    [0.4,  0.6,  0.8,  1.0,  1.2,  1.4,  1.6,  1.8],
-    }
-
-    PARAM_LABELS = {
-        'crowding_threshold': r'Crowding Threshold $\rho^*$',
-        'viral_increment':    r'Viral Increment $\delta_v$',
-        'lysis_threshold':    r'Lysis Threshold $V^*$',
-    }
-
-    def __init__(self, generations=600, n_replicates=5, grid_size=70, num_strains=12):
-        self.generations = generations
-        self.n_replicates = n_replicates
-        self.grid_size = grid_size
-        self.num_strains = num_strains
-        self.results = {}   # {param_name: {value: {'ktw': [...], 'abl': [...]}}}
-
-    # -------------------------------------------------------------------------
-    def _run_condition(self, ktw_enabled, param_name, param_value, rep):
-        kwargs = dict(self.BASELINE)
-        kwargs[param_name] = param_value
-        seed = rep if ktw_enabled else rep + 100
-        sim = PlanktonEcosystemSimulation(
-            grid_size=self.grid_size,
-            num_strains=self.num_strains,
-            mutation_rate=0.0,
-            ktw_enabled=ktw_enabled,
-            seed=seed,
-            **kwargs,
-        )
-        sim.run(self.generations)
-        return sim
-
-    # -------------------------------------------------------------------------
-    def run(self):
-        total = sum(len(v) for v in self.SWEEPS.values()) * 2 * self.n_replicates
-        done = 0
-        for param_name, values in self.SWEEPS.items():
-            self.results[param_name] = {}
-            for val in values:
-                ktw_sims, abl_sims = [], []
-                for rep in range(self.n_replicates):
-                    done += 1
-                    print(f"  [{done}/{total}] {param_name}={val:.2f}  "
-                          f"KtW=ON  rep={rep+1}")
-                    ktw_sims.append(
-                        self._run_condition(True, param_name, val, rep)
-                    )
-                    done += 1
-                    print(f"  [{done}/{total}] {param_name}={val:.2f}  "
-                          f"KtW=OFF rep={rep+1}")
-                    abl_sims.append(
-                        self._run_condition(False, param_name, val, rep)
-                    )
-                self.results[param_name][val] = {
-                    'ktw': ktw_sims,
-                    'abl': abl_sims,
-                }
-        print("\nSensitivity analysis complete.")
-
-    # -------------------------------------------------------------------------
-    @staticmethod
-    def _final_mean_std(sims, attr, last_n=50):
-        """Mean and std of the last `last_n` generations across replicates."""
-        vals = [np.mean(getattr(s, attr)[-last_n:]) for s in sims]
-        return np.mean(vals), np.std(vals)
-
-
-# =============================================================================
-# PLOTTING CLASS
-# =============================================================================
-
-class SensitivityPlotter:
-    """
-    Publication-ready figures from a completed SensitivityAnalysis instance.
-
-    Figure 1 (sensitivity_shannon.png):
-        3-panel plot, one panel per Tier 1 parameter.
-        Each panel shows final Shannon H' (mean +/- 1 SD) vs parameter value
-        for KtW-ON and KtW-OFF conditions.
-
-    Figure 2 (sensitivity_vacancies.png):
-        Same layout for final vacant cell count.
-
-    Figure 3 (sensitivity_dominance.png):
-        Same layout for final dominant strain fraction (%).
-    """
-
-    COLORS = {'ktw': 'steelblue', 'abl': 'darkorange'}
-    LABELS = {'ktw': 'KtW ON', 'abl': 'KtW OFF'}
-
-    def __init__(self, analysis: SensitivityAnalysis):
-        self.sa = analysis
-
-    # -------------------------------------------------------------------------
-    def _extract(self, param_name, attr, last_n=50):
-        values = sorted(self.sa.results[param_name].keys())
-        ktw_means, ktw_stds, abl_means, abl_stds = [], [], [], []
-        for v in values:
-            entry = self.sa.results[param_name][v]
-            km, ks = SensitivityAnalysis._final_mean_std(entry['ktw'], attr, last_n)
-            am, as_ = SensitivityAnalysis._final_mean_std(entry['abl'], attr, last_n)
-            ktw_means.append(km); ktw_stds.append(ks)
-            abl_means.append(am); abl_stds.append(as_)
-        return (np.array(values),
-                np.array(ktw_means), np.array(ktw_stds),
-                np.array(abl_means), np.array(abl_stds))
-
-    # -------------------------------------------------------------------------
-    def _three_panel(self, attr, ylabel, scale=1.0, filename='fig.png', title=''):
-        fig, axs = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
-        params = list(SensitivityAnalysis.SWEEPS.keys())
-
-        for ax, param_name in zip(axs, params):
-            xv, km, ks, am, as_ = self._extract(param_name, attr)
-            km *= scale; ks *= scale; am *= scale; as_ *= scale
-
-            ax.plot(xv, km, color=self.COLORS['ktw'], lw=2,
-                    marker='o', ms=5, label=self.LABELS['ktw'])
-            ax.fill_between(xv, km - ks, km + ks,
-                            alpha=0.25, color=self.COLORS['ktw'])
-            ax.plot(xv, am, color=self.COLORS['abl'], lw=2,
-                    marker='s', ms=5, label=self.LABELS['abl'])
-            ax.fill_between(xv, am - as_, am + as_,
-                            alpha=0.25, color=self.COLORS['abl'])
-
-            # Mark baseline
-            baseline_val = SensitivityAnalysis.BASELINE[param_name]
-            ax.axvline(baseline_val, color='gray', lw=1.2,
-                       linestyle='--', label=f'Baseline ({baseline_val})')
-
-            ax.set_xlabel(SensitivityAnalysis.PARAM_LABELS[param_name], fontsize=11)
-            ax.set_ylabel(ylabel if ax == axs[0] else '', fontsize=11)
-            ax.legend(fontsize=8)
-            ax.grid(True, linestyle='--', alpha=0.4)
-
-        fig.suptitle(title, fontsize=13, y=1.02)
-        plt.tight_layout()
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        plt.show()
-        print(f"Saved: {filename}")
-
-    # -------------------------------------------------------------------------
-    def plot_shannon(self):
-        self._three_panel(
-            attr='history_diversity',
-            ylabel="Shannon Diversity $H'$ (final mean)",
-            scale=1.0,
-            filename='sensitivity_shannon.png',
-            title='Sensitivity Analysis: Shannon Diversity',
-        )
-
-    def plot_vacancies(self):
-        self._three_panel(
-            attr='history_vacancies',
-            ylabel='Vacant Cells (final mean)',
-            scale=1.0,
-            filename='sensitivity_vacancies.png',
-            title='Sensitivity Analysis: Vacant Cells',
-        )
-
-    def plot_dominance(self):
-        self._three_panel(
-            attr='history_dominant',
-            ylabel='Dominant Strain Fraction (%, final mean)',
-            scale=100.0,
-            filename='sensitivity_dominance.png',
-            title='Sensitivity Analysis: Dominant Strain Fraction',
-        )
-
-    def plot_all(self):
-        self.plot_shannon()
-        self.plot_vacancies()
-        self.plot_dominance()
-
-
-# =============================================================================
-# SUMMARY PRINTER CLASS
-# =============================================================================
-
-class SensitivitySummary:
-    """
-    Prints a structured console summary of sensitivity results.
-    Reports final Shannon H' separation (KtW-ON minus KtW-OFF) per parameter
-    value, flagging values where separation collapses below a threshold.
-    """
-
-    def __init__(self, analysis: SensitivityAnalysis, collapse_threshold=0.05):
-        self.sa = analysis
-        self.collapse_threshold = collapse_threshold
-
-    def print(self):
-        print("\n" + "=" * 70)
-        print("SENSITIVITY ANALYSIS SUMMARY")
-        print(f"Generations: {self.sa.generations}  "
-              f"Replicates: {self.sa.n_replicates}  "
-              f"Grid: {self.sa.grid_size}x{self.sa.grid_size}  "
-              f"Strains: {self.sa.num_strains}")
-        print("=" * 70)
-
-        for param_name, label in SensitivityAnalysis.PARAM_LABELS.items():
-            print(f"\nParameter: {label}")
-            print(f"  Baseline value: {SensitivityAnalysis.BASELINE[param_name]}")
-            print(f"  {'Value':>8}  {'KtW-ON H\'':>12}  {'KtW-OFF H\'':>12}  "
-                  f"{'Delta H\'':>10}  {'Status':>12}")
-            print(f"  {'-'*8}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*12}")
-
-            for val in sorted(self.sa.results[param_name].keys()):
-                entry = self.sa.results[param_name][val]
-                km, ks = SensitivityAnalysis._final_mean_std(
-                    entry['ktw'], 'history_diversity'
-                )
-                am, as_ = SensitivityAnalysis._final_mean_std(
-                    entry['abl'], 'history_diversity'
-                )
-                delta = km - am
-                status = "ROBUST" if delta >= self.collapse_threshold else "COLLAPSED"
-                baseline_marker = (
-                    " <-- baseline"
-                    if val == SensitivityAnalysis.BASELINE[param_name]
-                    else ""
-                )
-                print(f"  {val:>8.2f}  {km:>10.3f}  {am:>10.3f}  "
-                      f"{delta:>10.3f}  {status:>12}{baseline_marker}")
-
-        print("\n" + "=" * 70)
-        print("NOTE: COLLAPSED indicates KtW-ON and KtW-OFF Shannon diversity")
-        print(f"separation < {self.collapse_threshold:.2f}, suggesting the coexistence")
-        print("result is not robust at that parameter value.")
-        print("=" * 70 + "\n")
-
-
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
 
 if __name__ == '__main__':
-
-    print("Initialising sensitivity analysis...")
-    print(f"Tier 1 parameters: crowding_threshold, viral_increment, lysis_threshold")
-    print(f"Replicates per condition: 5  |  Generations: 600\n")
-
-    sa = SensitivityAnalysis(
-        generations=600,
-        n_replicates=5,
-        grid_size=70,
-        num_strains=12,
-    )
-
-    sa.run()
-
-    summary = SensitivitySummary(sa, collapse_threshold=0.05)
-    summary.print()
-
-    plotter = SensitivityPlotter(sa)
-    plotter.plot_all()
+    main()

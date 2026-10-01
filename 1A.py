@@ -1,326 +1,235 @@
+"""
+1A.py -- main three-condition experiment (KtW-active | fixed-mortality | no-mortality).
+Uses the shared model in plankton_model.py.   QUICK=1 python 1A.py  runs a tiny smoke test.
+
+Changes relative to the submitted version (each tagged with the reviewer point it answers):
+  [R1-3,R2] model moved to plankton_model.py with a full plain-language description;
+            parameter table with units/status exported to parameters.csv
+  [R2]      20 replicates (was 10); 95% CIs and a replicate-convergence figure
+  [R1-6]    extended 2400-generation run (5 replicates) with checkpoint table
+  [R1-7]    rank-abundance curves + exponential-vs-power-law fits
+  [R1-10,R2] isotropy diagnostic + axis-aligned, equal-aspect rasters; new spatially
+            explicit local-diversity / nutrient maps (Fig. 5); patch-size statistic
+  [R2]      p_fixed calibrated per FED cell (the cells that can actually die), realised
+            mortality of all conditions reported so "same quantity of mortality" is checkable
+  [R2]      viability threshold (10/20/40 cells) recorded every generation
+  [both]    paired design: for replicate k all three conditions start from the SAME lattice
+"""
+import os
 import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-from scipy.signal import convolve2d
-from scipy.stats import entropy
+import matplotlib.ticker as ticker
+from scipy.stats import mannwhitneyu
 
+from plankton_model import (PlanktonEcosystemSimulation as Sim, PARAMETER_TABLE, calibrate_fixed_rate,
+                            rank_abundance, fit_rank_abundance, local_shannon, patch_stats, isotropy)
 
-class PlanktonEcosystemSimulation:
-    def __init__(self, grid_size=60, num_strains=10, mutation_rate=0.02):
-        
-        self.N = grid_size
-        self.num_strains = num_strains
-        self.mutation_rate = mutation_rate
-        self.starvation_counter = np.zeros((self.N, self.N), dtype=int)
-        self.ktw_enabled = True
+QUICK = os.environ.get('QUICK') == '1'
+L, M = 70, 12
+MU_MAIN = 0.0            # main runs use mu = 0 (Table 1 of the revision states this); mu is swept in sensitivity.py
+GENERATIONS = 60 if QUICK else 1200
+N_REPLICATES = 3 if QUICK else 20
+N_PILOT, PILOT_GENS = (2, 40) if QUICK else (5, 400)
+EXT_GENS, EXT_REPS = (100, 2) if QUICK else (2400, 5)
+CONDS = [('KtW_ON', 'ktw'), ('Fixed_Mort', 'fixed'), ('KtW_OFF', 'none')]
 
-        
-        # --- Core Layer Initializations ---
-        # 0 = Empty cell, 1 to num_strains = Plankton strains
-        self.grid = np.random.choice(
-            [0] + list(range(1, num_strains + 1)), 
-            size=(self.N, self.N), 
-            p=[0.7] + [0.3 / num_strains] * num_strains
-        )
-        
-        # Environmental layers (Continuous floats)
-        self.nutrients = np.ones((self.N, self.N)) * 1.0
-        # 3D array: Each strain has its own localized virus density field
-        self.viruses = np.zeros((num_strains + 1, self.N, self.N))
-        
-        # --- Rule 1: Generate Strict Mathematical Trade-Offs ---
-        # Strains that grow fast (high r) MUST require more food to survive (high K)
-        # Monod kinetics parameterization: K = alpha * r^2
-        np.random.seed(42) # For reproducible strain profiles
-        self.r = np.random.uniform(0.15, 0.45, size=num_strains + 1)
-        alpha = 2.0
-        self.K = alpha * (self.r ** 2)
-        
-        # --- Environmental Constants ---
-        self.nutrient_inflow = 0.10
-        self.diffusion_kernel = np.array([[0.05, 0.10, 0.05],
-                                          [0.10, 0.40, 0.10],
-                                          [0.05, 0.10, 0.05]]) # Must sum to 1.0
+plt.rcParams.update({'font.family': 'serif', 'font.size': 11, 'axes.spines.top': False,
+                     'axes.spines.right': False, 'figure.dpi': 150, 'savefig.dpi': 300,
+                     'savefig.bbox': 'tight'})
+COL = {'KtW_ON': '#2166AC', 'Fixed_Mort': '#D6604D', 'KtW_OFF': '#F4A82E'}
+LAB = {'KtW_ON': 'KtW-active', 'Fixed_Mort': 'Fixed mortality', 'KtW_OFF': 'No mortality'}
 
-        # Data tracking for publication analysis
-        self.history_diversity = []
-        self.history_occupancy = []
+# --------------------------------------------------------------------------
+# Parameter table (units / status) -> parameters.csv                    [R2]
+# --------------------------------------------------------------------------
+pd.DataFrame(PARAMETER_TABLE, columns=['name', 'symbol', 'value', 'units', 'status']).to_csv('parameters.csv', index=False)
 
-        self.history_shannon = []
-        self.history_dominant = []
-        self.history_top3 = []
-        self.history_vacancies = []
-        self.history_richness = []
-        
-    def _apply_fluid_diffusion(self):
-        """ Rule 3: Discrete Fluid Diffusion via 2D Convolution """
-        # Diffuse nutrients
-        self.nutrients = convolve2d(self.nutrients, self.diffusion_kernel, mode='same', boundary='wrap')
-        self.nutrients += self.nutrient_inflow
-        self.nutrients = np.clip(self.nutrients, 0.0, 3.0)
-        
-        # Diffuse all strain-specific virus fields independently
-        for s in range(1, self.num_strains + 1):
+# --------------------------------------------------------------------------
+# Step 1: calibrate p_fixed so fixed-mortality kills as many FED cells per
+# generation as KtW does (same "quantity" of mortality, no density-dependence).
+# --------------------------------------------------------------------------
+print('STEP 1: calibrating p_fixed')
+P_FIXED = calibrate_fixed_rate(N_PILOT, PILOT_GENS, grid_size=L, num_strains=M, mutation_rate=MU_MAIN)
+print(f'  p_fixed = {P_FIXED:.5f} deaths per fed cell per generation')
 
-            self.viruses[s] = convolve2d(
-                self.viruses[s],
-                self.diffusion_kernel,
-                mode='same',
-                boundary='wrap'
-            )
-
-            self.viruses[s] *= 0.98
-
-    def step(self):
-        """ Executes one full discrete generation of the 3-rule model """
-        next_grid = self.grid.copy()
-        
-        # Generate a random sequence of coordinates to prevent directional grid bias
-        coords = [(r, c) for r in range(self.N) for c in range(self.N)]
-        np.random.shuffle(coords)
-        
-        for r, c in coords:
-            strain = self.grid[r, c]
-            
-            if strain > 0:  # Cell is occupied by a plankton
-                # --- RULE 1: Nutrient Uptake & Local Starvation ---
-                local_n = self.nutrients[r, c]
-                monod_growth_prob = self.r[strain] * (local_n / (self.K[strain] + local_n))
-                
-                if local_n >= self.K[strain]:
-                    self.nutrients[r, c] -= self.K[strain] # Consume resource
-                    self.starvation_counter[r, c] = 0
-                    
-                    # --- RULE 2: Kill-The-Winner Predation Trigger ---
-                    # Calculate local density of its own strain in a 5x5 patch
-                    rows = [(r + dr) % self.N for dr in range(-2, 3)]
-                    cols = [(c + dc) % self.N for dc in range(-2, 3)]
-                    local_patch = self.grid[np.ix_(rows, cols)]
-
-                    local_density = np.sum(local_patch == strain) / local_patch.size
-
-                                        
-                    if self.ktw_enabled:
-                        if local_density > 0.35:
-                            self.viruses[strain, r, c] += 0.8
-
-                        viral_pressure = self.viruses[strain, r, c]
-
-                        if viral_pressure > 1.0:
-
-                            infection_prob = min(0.95, viral_pressure / 2.0)
-
-                            if np.random.rand() < infection_prob:
-                                next_grid[r, c] = 0
-                                self.starvation_counter[r, c] = 0
-                                continue                        
-
-                    
-                    # --- Local Reproduction and Mutation ---
-                    if np.random.rand() < monod_growth_prob:
-                        # Choose random neighbor in 8-cell Moore neighborhood
-                        dr, dc = np.random.choice([-1, 0, 1]), np.random.choice([-1, 0, 1])
-                        nr, nc = (r + dr) % self.N, (c + dc) % self.N
-
-                        target = self.grid[nr, nc]
-
-                        # Empty-space colonization
-                        if target == 0:
-
-                            next_grid[nr, nc] = strain
-                            self.starvation_counter[nr, nc] = 0
-
-                        # Direct competition
-                        elif target != strain:
-
-                            if np.random.rand() < 0.30:
-
-                                next_grid[nr, nc] = strain
-                                self.starvation_counter[nr, nc] = 0
-        
-        
-
-
-                else:
-                    self.starvation_counter[r, c] += 1
-                    if self.starvation_counter[r, c] >= 3:
-                        next_grid[r, c] = 0
-                        self.starvation_counter[r, c] = 0
-
-        self.grid = next_grid
-        
-        # --- RULE 3: Environmental Fluid Step ---
-        self._apply_fluid_diffusion()
-        
-        counts = np.bincount(self.grid.flatten(), minlength=self.num_strains + 1)
-        occupied = np.sum(counts[1:])
-        if occupied > 0:
-            p = counts[1:] / occupied
-            shannon_H = entropy(p[p > 0])
-            dominant_fraction = np.max(counts[1:]) / self.grid.size
-            sorted_counts = np.sort(counts[1:])[::-1]
-            top3_fraction = np.sum(sorted_counts[:3]) / self.grid.size
-            richness = np.sum(counts[1:] >= 20)
-        else:
-            shannon_H = 0
-            dominant_fraction = 0
-            top3_fraction = 0
-            richness = 0
-        self.history_diversity.append(shannon_H)
-        self.history_dominant.append(dominant_fraction)
-        self.history_top3.append(top3_fraction)
-        self.history_vacancies.append(self.grid.size - occupied)
-        self.history_richness.append(richness)
-
-    def print_summary(self, generation):
-        counts = np.bincount(self.grid.flatten(), minlength=self.num_strains + 1)
-        
-        # Occupancy
-        total_cells = self.N * self.N
-        occupied = np.sum(self.grid > 0)
-        vacant = total_cells - occupied
-        
-        # Strain census
-        active_strains = [(s, counts[s]) for s in range(1, self.num_strains + 1) if counts[s] >= 20]
-        dominant_strain = max(range(1, self.num_strains + 1), key=lambda s: counts[s])
-        dominant_fraction = counts[dominant_strain] / total_cells
-        sorted_counts = sorted(counts[1:], reverse=True)
-        top3_fraction = np.sum(sorted_counts[:3]) / total_cells
-        
-        # Nutrient state
-        mean_nutrient = np.mean(self.nutrients)
-        min_nutrient  = np.min(self.nutrients)
-        
-        # Viral state: max viral load across all strains and cells
-        max_viral_load = np.max(self.viruses[1:])
-        strains_under_viral_pressure = np.sum([
-            np.any(self.viruses[s] > 0.5) for s in range(1, self.num_strains + 1)
-        ])
-        
-        print(f"\n--- Generation {generation} ---")
-        print(f"  Grid occupancy     : {occupied}/{total_cells} cells filled ({100*occupied/total_cells:.1f}%), {vacant} vacant")
-        print(f"  Active strains     : {len(active_strains)} (threshold >= 20 cells)")
-        print(f"  Strain abundances  : {[(s, n) for s, n in active_strains]}")
-        print(f"  Dominant strain    : #{dominant_strain} at {100*dominant_fraction:.1f}% of grid")
-        print(f"  Top-3 strains      : {100*top3_fraction:.1f}% of grid")
-        occupied = counts[1:].sum()
-        p = counts[1:] / occupied
-        p = p[p > 0]
-        shannon = -np.sum(p * np.log(p))
-        print(f"  Shannon diversity  : {shannon:.3f}")
-        print(f"  Nutrient field     : mean={mean_nutrient:.3f}, min={min_nutrient:.3f}")
-        print(f"  Max viral load     : {max_viral_load:.3f}")
-        print(f"  Strains under viral pressure (load > 0.5): {strains_under_viral_pressure}")
-        
-
-# --- KtW Ablation Study with Replication ---
-N_REPLICATES = 10
-GENERATIONS = 1200
-
-all_ktw = []
-all_abl = []
-
+# --------------------------------------------------------------------------
+# Step 2: main experiment (paired initial lattices)
+# --------------------------------------------------------------------------
+print('STEP 2: main experiment')
+runs = {c: [] for c, _ in CONDS}
 for rep in range(N_REPLICATES):
-    print(f"\n=== Replicate {rep+1}/{N_REPLICATES} ===")
+    for cname, mode in CONDS:
+        sim = Sim(grid_size=L, num_strains=M, mutation_rate=MU_MAIN, mode=mode,
+                  fixed_mort_rate=P_FIXED, seed=rep).run(GENERATIONS)
+        runs[cname].append(sim)
+    print(f'  replicate {rep + 1}/{N_REPLICATES} done')
 
-    np.random.seed(rep)
-    sim_ktw = PlanktonEcosystemSimulation(grid_size=70, num_strains=12, mutation_rate=0.0)
-    sim_ktw.ktw_enabled = True
-    for gen in range(GENERATIONS):
-        sim_ktw.step()
-    all_ktw.append(sim_ktw)
+# --------------------------------------------------------------------------
+# Step 3: raw data + summary statistics
+# --------------------------------------------------------------------------
+HIST = dict(shannon_diversity='history_diversity', richness='history_richness',
+            richness_ge10='history_richness10', richness_ge40='history_richness40',
+            dominant_fraction='history_dominant', top3_fraction='history_top3',
+            vacancies='history_vacancies', mean_nutrient='history_nutrient',
+            lysis_events='history_lysis', fed_cells='history_fed')
+rows = []
+for cname, sims in runs.items():
+    for rep, s in enumerate(sims):
+        for g in range(GENERATIONS):
+            d = dict(condition=cname, replicate=rep, generation=g)
+            d.update({k: getattr(s, v)[g] for k, v in HIST.items()})
+            rows.append(d)
+pd.DataFrame(rows).to_csv('simulation_data.csv', index=False)
 
-    np.random.seed(rep + 100)
-    sim_abl = PlanktonEcosystemSimulation(grid_size=70, num_strains=12, mutation_rate=0.0)
-    sim_abl.ktw_enabled = False
-    for gen in range(GENERATIONS):
-        sim_abl.step()
-    all_abl.append(sim_abl)
+def final_mean(sims, attr, n=50):          # per-replicate mean over the last n generations
+    return np.array([np.mean(getattr(s, attr)[-n:]) for s in sims])
 
-# --- Aggregate histories ---
-def mean_std(sims, attr):
-    arr = np.array([getattr(s, attr) for s in sims])
-    return arr.mean(axis=0), arr.std(axis=0)
+def ci95(x):
+    x = np.asarray(x, float)
+    h = 1.96 * x.std(ddof=1) / np.sqrt(len(x)) if len(x) > 1 else np.nan
+    return x.mean() - h, x.mean() + h
 
-ktw_div_mean, ktw_div_std = mean_std(all_ktw, 'history_diversity')
-abl_div_mean, abl_div_std = mean_std(all_abl, 'history_diversity')
+summ = []
+for cname, sims in runs.items():
+    H = final_mean(sims, 'history_diversity')
+    lo, hi = ci95(H)
+    ps = [patch_stats(s.grid, M) for s in sims]
+    iso = pd.DataFrame([isotropy(s.grid) for s in sims]).mean().to_dict()
+    ra = pd.DataFrame([fit_rank_abundance(rank_abundance(s.grid, M)) for s in sims]).mean().to_dict()
+    summ.append(dict(condition=cname, n_replicates=len(sims), p_fixed=P_FIXED,
+                     shannon_mean=H.mean(), shannon_sd=H.std(ddof=1), shannon_ci95_lo=lo, shannon_ci95_hi=hi,
+                     richness_ge20_mean=final_mean(sims, 'history_richness').mean(),
+                     richness_ge10_mean=final_mean(sims, 'history_richness10').mean(),
+                     richness_ge40_mean=final_mean(sims, 'history_richness40').mean(),
+                     dominant_pct_mean=100 * final_mean(sims, 'history_dominant').mean(),
+                     top3_pct_mean=100 * final_mean(sims, 'history_top3').mean(),
+                     vacancies_mean=final_mean(sims, 'history_vacancies').mean(),
+                     mean_nutrient=final_mean(sims, 'history_nutrient').mean(),
+                     realised_death_rate_per_fed_cell=np.mean([s.mean_lysis_rate() for s in sims]),
+                     realised_death_rate_per_occupied_cell=np.mean([s.mean_lysis_rate_per_occupied() for s in sims]),
+                     mean_patch_size_cells=np.mean(ps),
+                     iso_H=iso['H'], iso_V=iso['V'], iso_Dplus=iso['D_plus'], iso_Dminus=iso['D_minus'],
+                     **{f'rankabund_{k}': v for k, v in ra.items()}))
+pd.DataFrame(summ).to_csv('simulation_summary.csv', index=False)
 
-ktw_rich_mean, ktw_rich_std = mean_std(all_ktw, 'history_richness')
-abl_rich_mean, abl_rich_std = mean_std(all_abl, 'history_richness')
+# paired tests on final Shannon diversity (same replicate index = same starting lattice)
+Hk, Hf, Hn = (final_mean(runs[c], 'history_diversity') for c in ('KtW_ON', 'Fixed_Mort', 'KtW_OFF'))
+tests = []
+for name, other in (('KtW_vs_Fixed', Hf), ('KtW_vs_None', Hn), ('Fixed_vs_None', None)):
+    a, b = (Hk, other) if other is not None else (Hf, Hn)
+    u = mannwhitneyu(a, b, alternative='two-sided') if len(a) > 1 else None
+    tests.append(dict(comparison=name, mean_diff=float(a.mean() - b.mean()),
+                      paired_diff_sd=float((a - b).std(ddof=1)) if len(a) > 1 else np.nan,
+                      mannwhitney_U=None if u is None else float(u.statistic),
+                      p_value=None if u is None else float(u.pvalue)))
+pd.DataFrame(tests).to_csv('simulation_tests.csv', index=False)
+print(pd.DataFrame(summ)[['condition', 'shannon_mean', 'shannon_ci95_lo', 'shannon_ci95_hi',
+                          'realised_death_rate_per_fed_cell']].to_string(index=False))
 
-ktw_dom_mean, ktw_dom_std = mean_std(all_ktw, 'history_dominant')
-abl_dom_mean, abl_dom_std = mean_std(all_abl, 'history_dominant')
-
-ktw_top3_mean, ktw_top3_std = mean_std(all_ktw, 'history_top3')
-abl_top3_mean, abl_top3_std = mean_std(all_abl, 'history_top3')
-
-ktw_vac_mean, ktw_vac_std = mean_std(all_ktw, 'history_vacancies')
-abl_vac_mean, abl_vac_std = mean_std(all_abl, 'history_vacancies')
-
+# --------------------------------------------------------------------------
+# Step 4: figures
+# --------------------------------------------------------------------------
 gens = np.arange(GENERATIONS)
+def band(ax, x, sims, attr, cname, scale=1.0):
+    a = np.array([getattr(s, attr) for s in sims]) * scale
+    m, sd = a.mean(0), a.std(0, ddof=1) if len(a) > 1 else 0 * a.mean(0)
+    ax.plot(x, m, color=COL[cname], lw=1.8, label=LAB[cname])
+    ax.fill_between(x, m - sd, m + sd, color=COL[cname], alpha=0.2)
 
-# --- Publication Metrics Plot ---
-fig, axs = plt.subplots(2, 2, figsize=(12, 10))
+def dress(ax, ylabel, xmax=None):
+    ax.set_xlabel('Generation'); ax.set_ylabel(ylabel); ax.set_xlim(0, xmax or GENERATIONS)
+    ax.xaxis.set_minor_locator(ticker.AutoMinorLocator(4)); ax.legend(loc='best')
 
-for ax, ktw_m, ktw_s, abl_m, abl_s, title in [
-    (axs[0,0], ktw_rich_mean, ktw_rich_std, abl_rich_mean, abl_rich_std, "Richness"),
-    (axs[0,1], ktw_div_mean,  ktw_div_std,  abl_div_mean,  abl_div_std,  "Shannon Diversity"),
-    (axs[1,0], ktw_dom_mean*100, ktw_dom_std*100, abl_dom_mean*100, abl_dom_std*100, "Dominant Strain (%)"),
-    (axs[1,1], ktw_top3_mean*100, ktw_top3_std*100, abl_top3_mean*100, abl_top3_std*100, "Top-3 Strain Share (%)"),
-]:
-    ax.plot(gens, ktw_m, color='steelblue', label='KtW ON')
-    ax.fill_between(gens, ktw_m - ktw_s, ktw_m + ktw_s, alpha=0.25, color='steelblue')
-    ax.plot(gens, abl_m, color='orange', label='KtW OFF')
-    ax.fill_between(gens, abl_m - abl_s, abl_m + abl_s, alpha=0.25, color='orange')
-    ax.set_title(title)
-    ax.legend()
+fig, axs = plt.subplots(2, 2, figsize=(11, 8.5)); fig.subplots_adjust(hspace=0.38, wspace=0.30)
+for ax, (attr, yl, sc, ttl) in zip(axs.flat, [
+        ('history_richness', 'Strain richness (≥20 cells)', 1, 'Strain richness'),
+        ('history_diversity', "Shannon diversity H′", 1, 'Shannon diversity'),
+        ('history_dominant', 'Dominant strain (% grid)', 100, 'Dominant strain'),
+        ('history_top3', 'Top-3 strain share (% grid)', 100, 'Top-3 strain share')]):
+    for c, _ in CONDS: band(ax, gens, runs[c], attr, c, sc)
+    dress(ax, yl); ax.set_title(ttl)
+for letter, ax in zip('ABCD', axs.flat): ax.text(-0.10, 1.04, letter, transform=ax.transAxes, fontsize=13, fontweight='bold')
+fig.suptitle(f'Figure 1. Diversity metrics (mean ± 1 s.d., n={N_REPLICATES} replicates)', y=1.01)
+fig.savefig('fig1_diversity_metrics.pdf'); fig.savefig('fig1_diversity_metrics.png')
 
-plt.tight_layout()
-plt.savefig('shannon-diversity.png', dpi=300)
-plt.show()
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+for c, _ in CONDS: band(ax, gens, runs[c], 'history_vacancies', c)
+dress(ax, 'Vacant cells'); ax.set_title(f'Figure 2. Vacant cells (n={N_REPLICATES})')
+fig.savefig('fig2_vacancies.pdf'); fig.savefig('fig2_vacancies.png')
 
-# --- Vacancies Plot ---
-plt.figure(figsize=(6, 4))
-plt.plot(gens, ktw_vac_mean, color='steelblue', label='KtW ON')
-plt.fill_between(gens, ktw_vac_mean - ktw_vac_std, ktw_vac_mean + ktw_vac_std, alpha=0.25, color='steelblue')
-plt.plot(gens, abl_vac_mean, color='orange', label='KtW OFF')
-plt.fill_between(gens, abl_vac_mean - abl_vac_std, abl_vac_mean + abl_vac_std, alpha=0.25, color='orange')
-plt.ylabel("Vacant Cells")
-plt.xlabel("Generation")
-plt.legend()
-plt.tight_layout()
-plt.savefig('vacancies.png', dpi=300)
-plt.show()
+# Fig 3: realised mortality (shows the "same quantity of mortality" claim explicitly)
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+for c in ('KtW_ON', 'Fixed_Mort'):
+    a = np.array([np.array(s.history_lysis) / np.maximum(np.array(s.history_fed), 1) for s in runs[c]])
+    ax.plot(gens, a.mean(0), color=COL[c], label=LAB[c])
+dress(ax, 'Deaths per fed cell per generation'); ax.set_title('Figure 3. Realised mortality of the two mortality conditions')
+fig.savefig('fig3_realised_mortality.pdf'); fig.savefig('fig3_realised_mortality.png')
 
-# --- Ablation Comparison Plot ---
-fig_abl, ax_abl = plt.subplots(figsize=(8, 5))
-ax_abl.plot(gens[:600], ktw_div_mean[:600], color='crimson', lw=2, label='KtW Active')
-ax_abl.fill_between(gens[:600], (ktw_div_mean - ktw_div_std)[:600], (ktw_div_mean + ktw_div_std)[:600], alpha=0.25, color='crimson')
-ax_abl.plot(gens[:600], abl_div_mean[:600], color='steelblue', lw=2, label='KtW Disabled (Ablation)')
-ax_abl.fill_between(gens[:600], (abl_div_mean - abl_div_std)[:600], (abl_div_mean + abl_div_std)[:600], alpha=0.25, color='steelblue')
-ax_abl.set_xlim(0, 600)
-ax_abl.set_ylim(0, 3)
-ax_abl.set_xlabel("Generations")
-ax_abl.set_ylabel("Shannon Diversity (H')")
-ax_abl.set_title("KtW Ablation: Diversity With vs Without Viral Predation")
-ax_abl.legend()
-ax_abl.grid(True, linestyle='--', alpha=0.6)
-fig_abl.savefig("ablation_comparison.png", dpi=300, bbox_inches='tight')
+# Fig 4: final grids. Plain axis-aligned raster, square cells, no transform. [R1-10]
+cmap = plt.get_cmap('tab20', M + 1)
+fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+for ax, (c, _) in zip(axes, CONDS):
+    im = ax.imshow(runs[c][-1].grid, cmap=cmap, vmin=0, vmax=M, interpolation='nearest', aspect='equal')
+    ax.set_title(LAB[c]); ax.set_xticks([]); ax.set_yticks([])
+cb = fig.colorbar(im, ax=axes, fraction=0.015, pad=0.02, ticks=range(M + 1))
+cb.ax.set_yticklabels(['Vacant'] + [f'Strain {i}' for i in range(1, M + 1)], fontsize=8)
+fig.suptitle('Figure 4. Final lattices (last replicate); 1 cell = 1 square pixel', y=1.02)
+fig.savefig('fig4_spatial_grids.pdf'); fig.savefig('fig4_spatial_grids.png')
 
-# --- Spatial Grid Panels (last replicate) ---
-fig_grid, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-cmap = plt.cm.get_cmap('tab20', 14)
+# Fig 5: spatially explicit maps of local diversity (11x11 window) and nutrient   [R2]
+fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+for j, (c, _) in enumerate(CONDS):
+    s = runs[c][-1]
+    im1 = axes[0, j].imshow(local_shannon(s.grid, M), cmap='viridis', vmin=0, vmax=np.log(6), aspect='equal')
+    im2 = axes[1, j].imshow(s.nutrients, cmap='magma', vmin=0, vmax=max(0.5, s.nutrients.max()), aspect='equal')
+    axes[0, j].set_title(LAB[c])
+    for a in axes[:, j]: a.set_xticks([]); a.set_yticks([])
+fig.colorbar(im1, ax=axes[0, :], fraction=0.02, label="Local Shannon H′ (11×11 window)")
+fig.colorbar(im2, ax=axes[1, :], fraction=0.02, label='Local nutrient')
+fig.suptitle('Figure 5. Spatially explicit local diversity (top) and nutrient (bottom), generation ' + str(GENERATIONS), y=0.98)
+fig.savefig('fig5_spatial_maps.pdf'); fig.savefig('fig5_spatial_maps.png')
 
-ax1.imshow(all_ktw[-1].grid, cmap=cmap, vmin=0, vmax=13, interpolation='nearest')
-ax1.set_title("Final Grid: KtW Active")
-ax1.axis('off')
+# Fig 6: rank-abundance                                                     [R1-7]
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+for c, _ in CONDS:
+    ra = [rank_abundance(s.grid, M) for s in runs[c]]
+    k = max(len(r) for r in ra)
+    mean = np.nanmean([np.pad(r, (0, k - len(r)), constant_values=np.nan) for r in ra], axis=0)
+    ax.semilogy(np.arange(1, k + 1), mean, 'o-', color=COL[c], label=LAB[c])
+ax.set_xlabel('Strain rank'); ax.set_ylabel('Relative abundance'); ax.legend()
+ax.set_title('Figure 6. Rank-abundance at final generation (mean of replicates)')
+fig.savefig('fig6_rank_abundance.pdf'); fig.savefig('fig6_rank_abundance.png')
 
-ax2.imshow(all_abl[-1].grid, cmap=cmap, vmin=0, vmax=13, interpolation='nearest')
-ax2.set_title("Final Grid: KtW Disabled")
-ax2.axis('off')
+# Fig 7: is n enough?  running mean of final H' with 95% CI vs number of replicates  [R2]
+fig, ax = plt.subplots(figsize=(6.5, 4.5))
+for c, _ in CONDS:
+    H = final_mean(runs[c], 'history_diversity')
+    n = np.arange(2, len(H) + 1)
+    if len(n):
+        mu_ = [H[:k].mean() for k in n]; hw = [1.96 * H[:k].std(ddof=1) / np.sqrt(k) for k in n]
+        ax.plot(n, mu_, color=COL[c], label=LAB[c]); ax.fill_between(n, np.array(mu_) - hw, np.array(mu_) + hw, color=COL[c], alpha=0.2)
+ax.set_xlabel('Number of replicates'); ax.set_ylabel("Final Shannon H′ (mean, 95% CI)"); ax.legend()
+fig.savefig('fig7_replicate_convergence.pdf'); fig.savefig('fig7_replicate_convergence.png')
 
-fig_grid.savefig("ablation_grids.png", dpi=300, bbox_inches='tight')
-plt.show()
-
-
-
+# --------------------------------------------------------------------------
+# Step 5: run-length check (2400 generations)                             [R1-6]
+# --------------------------------------------------------------------------
+print('STEP 5: extended runs')
+ext = {c: [Sim(grid_size=L, num_strains=M, mutation_rate=MU_MAIN, mode=m, fixed_mort_rate=P_FIXED,
+               seed=rep).run(EXT_GENS) for rep in range(EXT_REPS)] for c, m in CONDS}
+cps = [g for g in (300, 600, 1200, 1800, 2400) if g <= EXT_GENS] or [EXT_GENS]
+rows = [dict(condition=c, generation=g, shannon_mean=np.mean([np.mean(s.history_diversity[max(0, g - 50):g]) for s in ext[c]]),
+             richness_mean=np.mean([np.mean(s.history_richness[max(0, g - 50):g]) for s in ext[c]]),
+             richness_ge10_mean=np.mean([np.mean(s.history_richness10[max(0, g - 50):g]) for s in ext[c]]))
+        for c in ext for g in cps]
+pd.DataFrame(rows).to_csv('extended_run_checkpoints.csv', index=False)
+fig, axs = plt.subplots(1, 2, figsize=(12, 4.3))
+for c, _ in CONDS:
+    for ax, attr, yl in ((axs[0], 'history_diversity', "Shannon H′"), (axs[1], 'history_richness', 'Richness (≥20 cells)')):
+        band(ax, np.arange(EXT_GENS), ext[c], attr, c); dress(ax, yl, EXT_GENS)
+fig.suptitle(f'Figure S1. Extended run to {EXT_GENS} generations (n={EXT_REPS})', y=1.02)
+fig.savefig('figS1_extended_run.pdf'); fig.savefig('figS1_extended_run.png')
+print('All outputs written.')

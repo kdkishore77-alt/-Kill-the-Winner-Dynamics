@@ -1,157 +1,78 @@
-# ACCESS INFORMATION
+# Kill-the-Winner Dynamics: a minimal cellular automaton
 
-## 1. Licenses/restrictions placed on the data or code
+Code and data for *"A Minimal Cellular Automaton Addresses the Paradox of the Plankton via Kill-the-Winner Dynamics"*.
 
-CC0 1.0 Universal (CC0 1.0) Public Domain Dedication.
+A three-rule, spatially explicit cellular automaton (70×70 periodic lattice, 12 strains, one diffusing nutrient) compares three conditions that differ only in the mortality rule:
 
-All code and data files in this repository are provided without restriction for use, modification, and redistribution.
+| Condition | Mortality rule |
+|---|---|
+| **KtW-active** | density-dependent, strain-specific viral accumulation and lysis |
+| **Fixed mortality** | constant death probability per *fed* cell, independent of density (calibrated to match KtW-active) |
+| **No mortality** | viral rule absent |
 
-## 2. Data derived from other sources
+All quantities are dimensionless (time is in generations).
 
-No external empirical datasets were used in this study.
+## Files
 
-All data files contained in this repository were generated directly from the simulation models included in the code archive.
+| File | Purpose |
+|---|---|
+| `plankton_model.py` | The model (shared by both scripts), plus calibration and analysis helpers |
+| `1A.py` | Main three-condition experiment, run-length check, spatial and rank–abundance analyses |
+| `sensitivity.py` | One-at-a-time robustness sweeps (15 parameters, lattice size, mutation rate, trade-off shape) |
 
-## 3. Recommended citation for this data/code archive
+## Requirements
 
-Anonymous. Simulation code and generated data associated with the manuscript under review. Data and code repository submitted for peer review in *The American Naturalist*.
+Python 3.9+ with `numpy`, `pandas`, `scipy`, `matplotlib`.
 
-# DATA & CODE FILE OVERVIEW
+```
+pip install numpy pandas scipy matplotlib
+```
 
-This repository consists of two Python scripts, three generated data files, multiple figure files, and this README document.
+## Usage
 
-## Data files and variables
+```bash
+# Quick smoke test (tiny runs, a few minutes at most)
+QUICK=1 python 1A.py
+QUICK=1 python sensitivity.py --analysis tier1
 
-### 1. raw_simulation_data.csv
+# Main experiment: 20 paired replicates x 1200 generations,
+# plus a 2400-generation check (5 replicates)
+python 1A.py
 
-Generation-level output from the Kill-the-Winner (KtW) ablation experiment implemented in `1A.py`.
+# Sensitivity analyses (settings used in the paper: 5 replicates x 600 generations)
+python sensitivity.py --analysis all --reps 5 --gens 600 --workers 8
+```
 
-Variables:
+Available `--analysis` options: `tier1` (ρ\*, δ_v, V\*), `tier2` (all other parameters), `grid` (L = 50–140), `tradeoff` (α and exponent k), `tradeoff_matched` (k with α rescaled so the mean K_s is unchanged), `mutation` (μ = 0–0.05), or `all`.
 
-| Variable          | Description                                                             |
-| ----------------- | ----------------------------------------------------------------------- |
-| condition         | Experimental treatment (KtW_ON or KtW_OFF)                              |
-| replicate         | Replicate identifier                                                    |
-| generation        | Simulation generation (time step)                                       |
-| shannon_diversity | Shannon diversity index (H') computed from strain abundances            |
-| richness          | Number of strains exceeding the activity threshold (≥20 occupied cells) |
-| dominant_fraction | Fraction of the lattice occupied by the dominant strain                 |
-| top3_fraction     | Fraction of the lattice occupied by the three most abundant strains     |
-| vacancies         | Number of unoccupied lattice cells                                      |
+Note: `sensitivity.py` defaults to 10 replicates; pass `--reps 5` to reproduce the tables in the Supplement.
 
-### 2. raw_sensitivity_data.csv
+## Design notes
 
-Generation-level output from the sensitivity analysis implemented in `sensitivity.py`.
+- **Fixed-mortality control.** `p_fixed` is calibrated as deaths per *fed* cell per generation from KtW-active pilot runs (0.0202 at baseline) and is re-calibrated at every parameter value in the sweeps. Realised death rates of all conditions are reported.
+- **Paired design.** For replicate *k*, all three conditions start from the same lattice (`seed = k`) and then use independent random streams. Strain traits are fixed across replicates and conditions.
+- **Mutation.** The main runs use μ = 0. μ is a relabelling rate (an offspring becomes one of the 12 existing strains); no new trait values arise.
+- **Same model everywhere.** `sensitivity.py` imports the model from `plankton_model.py`, so the main experiment and the sweeps use identical rules.
 
-Variables:
+## Outputs
 
-| Variable          | Description                                                             |
-| ----------------- | ----------------------------------------------------------------------- |
-| parameter         | Parameter varied during sensitivity analysis                            |
-| parameter_value   | Value assigned to the parameter                                         |
-| condition         | Experimental treatment (KtW_ON or KtW_OFF)                              |
-| replicate         | Replicate identifier                                                    |
-| generation        | Simulation generation (time step)                                       |
-| shannon_diversity | Shannon diversity index (H')                                            |
-| vacancies         | Number of unoccupied lattice cells                                      |
-| dominant_fraction | Fraction of the lattice occupied by the dominant strain                 |
-| richness          | Number of strains exceeding the activity threshold (≥20 occupied cells) |
+**`1A.py`** writes:
 
-### 3. sensitivity_summary_statistics.csv
+- `parameters.csv` – parameter values, units and status
+- `simulation_data.csv` – per-generation data for every replicate
+- `simulation_summary.csv` – final-state statistics (Table 2), 95% CIs, patch size, isotropy, rank–abundance fits
+- `simulation_tests.csv` – Mann–Whitney tests on final Shannon diversity
+- `extended_run_checkpoints.csv` – 2400-generation checkpoints (Table S3)
+- Figures `fig1`–`fig7` and `figS1` (`.png` and `.pdf`)
 
-Processed summary statistics calculated from the sensitivity-analysis simulations.
+**`sensitivity.py`** writes, for each analysis, `sensitivity_<analysis>_raw.csv`, `sensitivity_<analysis>_summary.csv` (with the ΔH′ separations and the 0.05 collapse flag) and `sensitivity_<analysis>.png`.
 
-Variables:
+Figure mapping to the manuscript: `fig1`–`fig5` = Figures 1–5; `fig6` = Fig. S4 (rank–abundance); `fig7` = Fig. S5 (replicate convergence); `figS1` = Fig. S1; `sensitivity_tier1.png` = Fig. S2; the other sensitivity plots = Fig. S3.
 
-| Variable        | Description                                                            |
-| --------------- | ---------------------------------------------------------------------- |
-| parameter       | Parameter varied during sensitivity analysis                           |
-| parameter_value | Value assigned to the parameter                                        |
-| condition       | Experimental treatment (KtW_ON or KtW_OFF)                             |
-| mean_shannon    | Mean Shannon diversity over the final 50 generations across replicates |
-| sd_shannon      | Standard deviation of Shannon diversity across replicates              |
+## Citation
 
-## Code scripts and workflow
+If you use this code, please cite the paper (details to be added on publication).
 
-### 1. 1A.py
+## Contact
 
-Primary simulation model of a spatial plankton ecosystem.
-
-The model incorporates:
-
-* Nutrient-dependent growth using Monod kinetics.
-* Explicit growth–resource trade-offs among competing strains.
-* Localized Kill-the-Winner (KtW) viral predation.
-* Diffusion of nutrients and viral particles across the spatial lattice.
-* Competition for space among plankton strains.
-
-The script performs replicated simulations under two conditions:
-
-* KtW active.
-* KtW disabled (ablation condition).
-
-Outputs:
-
-* raw_simulation_data.csv
-* shannon-diversity.png
-* vacancies.png
-* ablation_comparison.png
-* ablation_grids.png
-
-### 2. sensitivity.py
-
-Sensitivity-analysis framework used to evaluate the robustness of model outcomes to variation in key KtW parameters.
-
-Parameters evaluated:
-
-* crowding_threshold (ρ*)
-* viral_increment (δv)
-* lysis_threshold (V*)
-
-For each parameter value, replicated simulations are performed under both KtW-ON and KtW-OFF conditions.
-
-Outputs:
-
-* raw_sensitivity_data.csv
-* sensitivity_summary_statistics.csv
-* sensitivity_shannon.png
-* sensitivity_vacancies.png
-* sensitivity_dominance.png
-
-## Workflow
-
-To reproduce all analyses and figures:
-
-1. Run `1A.py`.
-2. Run `sensitivity.py`.
-3. Generated CSV files contain the complete simulation outputs used for analysis.
-4. Generated PNG files reproduce the figures reported in the manuscript.
-
-# SOFTWARE VERSIONS
-
-Analyses were conducted in Python 3.
-
-Required packages:
-
-* numpy
-* scipy
-* matplotlib
-* pandas
-
-Key imported modules include:
-
-* numpy
-* matplotlib.pyplot
-* scipy.signal.convolve2d
-* scipy.stats.entropy
-* pandas
-
-Users should install versions of these packages compatible with their Python distribution.
-
-# REFERENCES
-
-Monod, J. 1949. The growth of bacterial cultures. *Annual Review of Microbiology* 3:371–394.
-
-Thingstad, T. F. 2000. Elements of a theory for the mechanisms controlling abundance, diversity, and biogeochemical role of lytic bacterial viruses in aquatic systems. *Limnology and Oceanography* 45:1320–1328.
-
-Winter, C., T. Bouvier, M. G. Weinbauer, and T. F. Thingstad. 2010. Trade-offs between competition and defense specialists among unicellular planktonic organisms: the “Kill the Winner” hypothesis revisited. *Microbiology and Molecular Biology Reviews* 74:42–57.
+Kishore Dutta, Department of Physics, Handique Girls' College, Guwahati 781 001, India – kdkishore77@gmail.com
